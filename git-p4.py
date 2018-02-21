@@ -316,12 +316,17 @@ def p4_last_change():
     results = p4CmdList(["changes", "-m", "1"], skip_info=True)
     return int(results[0]['change'])
 
-def p4_describe(change):
+def p4_describe(change, shelved=False):
     """Make sure it returns a valid result by checking for
        the presence of field "time".  Return a dict of the
        results."""
 
-    ds = p4CmdList(["describe", "-s", str(change)], skip_info=True)
+    cmd = ["describe", "-s"]
+    if shelved:
+        cmd += ["-S"]
+    cmd += [str(change)]
+
+    ds = p4CmdList(cmd, skip_info=True)
     if len(ds) != 1:
         die("p4 describe -s %d did not return 1 result: %s" % (change, str(ds)))
 
@@ -2421,6 +2426,18 @@ class P4Sync(Command, P4UserMap):
         if gitConfig("git-p4.syncFromOrigin") == "false":
             self.syncWithOrigin = False
 
+        self.depotPaths = []
+        self.changeRange = ""
+        self.previousDepotPaths = []
+        self.hasOrigin = False
+
+        # map from branch depot path to parent branch
+        self.knownBranches = {}
+        self.initialParents = {}
+
+        self.tz = "%+03d%02d" % (- time.timezone / 3600, ((- time.timezone % 3600) / 60))
+        self.labels = {}
+
     # Force a checkpoint in fast-import and wait for it to finish
     def checkpoint(self):
         self.gitStream.write("checkpoint\n\n")
@@ -2434,15 +2451,20 @@ class P4Sync(Command, P4UserMap):
                              for path in self.cloneExclude]
         files = []
         fnum = 0
+        print("depotPaths=%s" % self.depotPaths)
+        print("commit=%s" % commit)
         while commit.has_key("depotFile%s" % fnum):
             path =  commit["depotFile%s" % fnum]
 
+            print("**** path=%s" % path)
             if [p for p in self.cloneExclude
                 if p4PathStartsWith(path, p)]:
                 found = False
             else:
                 found = [p for p in self.depotPaths
                          if p4PathStartsWith(path, p)]
+
+            print("extractFilesFromCommit: found=%s, depotPaths %s, path %s" % (str(found), self.depotPaths, path))
             if not found:
                 fnum = fnum + 1
                 continue
@@ -2816,6 +2838,7 @@ class P4Sync(Command, P4UserMap):
         author = details["user"]
         jobs = self.extractJobsFromCommit(details)
 
+        print("files=%s" % str(files))
         if self.verbose:
             print('commit into {0}'.format(branch))
 
@@ -3162,10 +3185,10 @@ class P4Sync(Command, P4UserMap):
         else:
             return None
 
-    def importChanges(self, changes):
+    def importChanges(self, changes, shelved=False):
         cnt = 1
         for change in changes:
-            description = p4_describe(change)
+            description = p4_describe(change, shelved)
             self.updateOptionDict(description)
 
             if not self.silent:
@@ -3235,6 +3258,7 @@ class P4Sync(Command, P4UserMap):
                                 print "Parent of %s not found. Committing into head of %s" % (branch, parent)
                             self.commit(description, filesForCommit, branch, parent)
                 else:
+                    print("got to here:%s" % description)
                     files = self.extractFilesFromCommit(description)
                     self.commit(description, files, self.branch,
                                 self.initialParent)
@@ -3300,17 +3324,23 @@ class P4Sync(Command, P4UserMap):
             print "IO error with git fast-import. Is your git version recent enough?"
             print self.gitError.read()
 
+    def openStreams(self):
+        self.importProcess = subprocess.Popen(["git", "fast-import"],
+                                              stdin=subprocess.PIPE,
+                                              stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE);
+        self.gitOutput = self.importProcess.stdout
+        self.gitStream = self.importProcess.stdin
+        self.gitError = self.importProcess.stderr
+
+    def closeStreams(self):
+        self.gitStream.close()
+        if self.importProcess.wait() != 0:
+            die("fast-import failed: %s" % self.gitError.read())
+        self.gitOutput.close()
+        self.gitError.close()
 
     def run(self, args):
-        self.depotPaths = []
-        self.changeRange = ""
-        self.previousDepotPaths = []
-        self.hasOrigin = False
-
-        # map from branch depot path to parent branch
-        self.knownBranches = {}
-        self.initialParents = {}
-
         if self.importIntoRemotes:
             self.refPrefix = "refs/remotes/p4/"
         else:
@@ -3497,15 +3527,7 @@ class P4Sync(Command, P4UserMap):
                     b = b[len(self.projectName):]
                 self.createdBranches.add(b)
 
-        self.tz = "%+03d%02d" % (- time.timezone / 3600, ((- time.timezone % 3600) / 60))
-
-        self.importProcess = subprocess.Popen(["git", "fast-import"],
-                                              stdin=subprocess.PIPE,
-                                              stdout=subprocess.PIPE,
-                                              stderr=subprocess.PIPE);
-        self.gitOutput = self.importProcess.stdout
-        self.gitStream = self.importProcess.stdin
-        self.gitError = self.importProcess.stderr
+        self.openStreams()
 
         if revision:
             self.importHeadRevision(revision)
@@ -3585,11 +3607,7 @@ class P4Sync(Command, P4UserMap):
             missingP4Labels = p4Labels - gitTags
             self.importP4Labels(self.gitStream, missingP4Labels)
 
-        self.gitStream.close()
-        if self.importProcess.wait() != 0:
-            die("fast-import failed: %s" % self.gitError.read())
-        self.gitOutput.close()
-        self.gitError.close()
+        self.closeStreams()
 
         # Cleanup temporary branches created during import
         if self.tempBranches != []:
@@ -3721,6 +3739,40 @@ class P4Clone(P4Sync):
 
         return True
 
+class P4Unshelve(Command):
+    def __init__(self):
+        Command.__init__(self)
+        self.options = []
+        self.description = "Unshelve a P4 changelist into a git commit"
+        self.usage = "usage: %prog [options] changelist"
+        self.options += [
+                optparse.make_option("--no-commit", dest="noCommit",
+                    action='store_true', default=False,
+                    help="do not commit, just update the files"),
+        ]
+        self.verbose = False
+        self.noCommit = False
+
+    def run(self, args):
+        if len(args) < 1:
+            return False
+        sync = P4Sync()
+        changes = args
+        sync.initialParent = "HEAD"
+        sync.branch = "refs/remotes/p4/unshelved/%s" % args[0]
+        sync.verbose = self.verbose
+
+        [upstream, settings] = findUpstreamBranchPoint()
+        sync.depotPaths = settings['depot-paths']
+        sync.branchPrefixes = sync.depotPaths
+
+        sync.openStreams()
+        sync.loadUserMapFromCache()
+        sync.importChanges(changes, shelved=True)
+        sync.closeStreams()
+
+        return True
+
 class P4Branches(Command):
     def __init__(self):
         Command.__init__(self)
@@ -3775,7 +3827,8 @@ commands = {
     "rebase" : P4Rebase,
     "clone" : P4Clone,
     "rollback" : P4RollBack,
-    "branches" : P4Branches
+    "branches" : P4Branches,
+    "unshelve" : P4Unshelve,
 }
 
 
