@@ -164,6 +164,26 @@ $ git p4 submit --shelve
 $ git p4 submit --update-shelve 1234 --update-shelve 2345
 ----
 
+
+format-patch
+~~~~~~~~~~
+This will attempt to create a unified diff (using the git patch variant) which
+can be passed to patch. This is generated using the output from "p4 describe".
+
+It includes the contents of added files (which "p4 describe" does not).
+
+It will handle both normal and shelved (pending) changelists.
+
+Because of the way this works, it will be much slower than the normal git-p4 clone
+path.
+
+----
+$ git p4 format-patch 12345
+$ git p4 format-patch --output patchdir 12345 12346 12347
+$ git p4 format-patch --strip-depot-prefix 12348 > out.patch
+$ git am out.patch
+----
+
 OPTIONS
 -------
 
@@ -336,6 +356,20 @@ These options can be used to modify 'git p4 rebase' behavior.
 
 --import-labels::
 	Import p4 labels.
+
+Format-patch options
+~~~~~~~~~~~~~~~~~~~~
+
+--output::
+    Write patches to this directory (which must exist) instead of to
+    standard output.
+
+--use-client-spec::
+    Use the client specification to map files into the patch.
+
+--depot-root::
+    Use the specified path as the root of the patch, stripping it
+    from filenames.
 
 DEPOT PATH SYNTAX
 -----------------

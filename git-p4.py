@@ -26,6 +26,7 @@ import zipfile
 import zlib
 import ctypes
 import errno
+import time
 
 try:
     from subprocess import CalledProcessError
@@ -50,6 +51,70 @@ defaultLabelRegexp = r'[a-zA-Z0-9_\-.]+$'
 # Grab changes in blocks of this many revisions, unless otherwise requested
 defaultBlockSize = 512
 
+# Try to encpasulate the various options for mangling P4 paths into Git paths
+class P4ToGitPathOptions:
+    def __init__(self):
+        self.useClientSpec = False
+        self.keepRepoPath = False
+        self.detectBranches = False
+        self.depotPaths = []
+        self.clientSpecDirs = None
+        self.knownBranches = None
+        self.branchPrefixes = None
+
+    def run(self):
+        if self.useClientSpec:
+            self.clientSpecDirs = getClientSpec()
+
+    def strip_repo_path(self, path, prefixes=None):
+        """When streaming files, this is called to map a p4 depot path
+           to where it should go in git.  The prefixes are either
+           self.depotPaths, or self.branchPrefixes in the case of
+           branch detection."""
+    
+        if not prefixes:
+            prefixes = self.branchPrefixes
+
+        if self.useClientSpec:
+            # branch detection moves files up a level (the branch name)
+            # from what client spec interpretation gives
+            path = self.clientSpecDirs.map_in_client(path)
+            if self.detectBranches:
+                for b in self.knownBranches:
+                    if path.startswith(b + "/"):
+                        path = path[len(b)+1:]
+    
+        elif self.keepRepoPath:
+            # Preserve everything in relative path name except leading
+            # //depot/; just look at first prefix as they all should
+            # be in the same depot.
+            depot = re.sub("^(//[^/]+/).*", r'\1', prefixes[0])
+            if p4PathStartsWith(path, depot):
+                path = path[len(depot):]
+    
+        else:
+            for p in prefixes:
+                if p4PathStartsWith(path, p):
+                    path = path[len(p):]
+                    break
+    
+        path = wildcard_decode(path)
+        return path
+
+    def make_rel_path_ignoring_branch_mapping(self, path):
+        """ Given a depot path, return the corresponding path within
+            the git repo
+
+            FIXME: this function appears to exist solely to avoid the
+            branch mapping in strip_repo_path()
+        """
+        if self.useClientSpec:
+            relPath = self.clientSpecDirs.map_in_client(path)
+        else:
+            relPath = self.strip_repo_path(path, self.depotPaths)
+
+        return relPath
+
 class P4FileInfo(dict):
     """ helper class for dealing with dictionaries of Perforce file info
         fields in the <field><revision> format, such as "depotFile42".
@@ -72,9 +137,11 @@ class P4FileInfo(dict):
 
     def is_text(self): return self.filetype() == "text"
     def is_symlink(self): return self.filetype() == "symlink"
+    def is_binary(self): return self.filetype() == "binary"
 
     def is_add(self): return self.action() == "add"
     def is_delete(self): return self.action() == "delete"
+    def is_edited(self): return self.action() == "edit"
 
 def p4_build_cmd(cmd):
     """Build a suitable p4 command line.
@@ -342,12 +409,17 @@ def p4_last_change():
     results = p4CmdList(["changes", "-m", "1"], skip_info=True)
     return int(results[0]['change'])
 
-def p4_describe(change):
+def p4_describe(change, shelved=False):
     """Make sure it returns a valid result by checking for
        the presence of field "time".  Return a dict of the
        results."""
 
-    ds = p4CmdList(["describe", "-s", str(change)], skip_info=True)
+    cmd = ["describe", "-s"]
+    if shelved:
+        cmd += ["-S"]
+    cmd += [str(change)]
+
+    ds = p4CmdList(cmd, skip_info=True)
     if len(ds) != 1:
         die("p4 describe -s %d did not return 1 result: %s" % (change, str(ds)))
 
@@ -398,7 +470,14 @@ def split_p4_type(p4type):
     mods = ""
     if len(s) > 1:
         mods = s[1]
-    return (base, mods)
+
+    git_mode = "100644"
+    if "x" in mods:
+        git_mode = "100755"
+    if base == "symlink":
+        git_mode = "120000"
+
+    return (base, mods, git_mode)
 
 #
 # return the raw p4 type of a file (text, text+ko, etc)
@@ -439,7 +518,7 @@ def p4_keywords_regexp_for_file(file):
     if not os.path.exists(file):
         return None
     else:
-        (type_base, type_mods) = split_p4_type(p4_type(file))
+        (type_base, type_mods, _) = split_p4_type(p4_type(file))
         return p4_keywords_regexp_for_type(type_base, type_mods)
 
 def setP4ExecBit(file, mode):
@@ -1233,6 +1312,12 @@ class P4UserMap:
             return False
         else:
             return True
+
+    def getP4UsernameEmail(self, userid):
+        if not userid in self.users:
+            sys.exit("could not find user %s in usermap, perhaps cachefile %s is out of date?" %
+                    (userid, self.getUserCacheFilename()))
+        return self.users[userid]
 
     def getUserCacheFilename(self):
         home = os.environ.get("HOME", os.environ.get("USERPROFILE"))
@@ -2345,11 +2430,14 @@ class View(object):
             return  # All files in cache
 
         where_result = p4CmdList(["-x", "-", "where"], stdin=fileArgs)
+        errorMsg = None
         for res in where_result:
             if "code" in res and res["code"] == "error":
                 # assume error is "... file(s) not in client view"
+                errorMsg = res["data"].rstrip()
                 continue
             if "clientFile" not in res:
+                if errorMsg: print(errorMsg)
                 die("No clientFile in 'p4 where' output")
             if "unmap" in res:
                 # it will list all of them, but only one not unmap-ped
@@ -2379,12 +2467,13 @@ class View(object):
         die( "Error: %s is not found in client spec path" % depot_path )
         return ""
 
-class P4Sync(Command, P4UserMap):
+class P4Sync(Command, P4UserMap, P4ToGitPathOptions):
     delete_actions = ( "delete", "move/delete", "purge" )
 
     def __init__(self):
         Command.__init__(self)
         P4UserMap.__init__(self)
+        P4ToGitPathOptions.__init__(self)
         self.options = [
                 optparse.make_option("--branch", dest="branch"),
                 optparse.make_option("--detect-branches", dest="detectBranches", action="store_true"),
@@ -2419,7 +2508,6 @@ class P4Sync(Command, P4UserMap):
         self.createdBranches = set()
         self.committedChanges = set()
         self.branch = ""
-        self.detectBranches = False
         self.detectLabels = False
         self.importLabels = False
         self.changesFile = ""
@@ -2427,11 +2515,9 @@ class P4Sync(Command, P4UserMap):
         self.importIntoRemotes = True
         self.maxChanges = ""
         self.changes_block_size = None
-        self.keepRepoPath = False
         self.depotPaths = None
         self.p4BranchesInGit = []
         self.cloneExclude = []
-        self.useClientSpec = False
         self.useClientSpec_from_options = False
         self.clientSpecDirs = None
         self.tempBranches = []
@@ -2487,38 +2573,6 @@ class P4Sync(Command, P4UserMap):
             jnum = jnum + 1
         return jobs
 
-    def stripRepoPath(self, path, prefixes):
-        """When streaming files, this is called to map a p4 depot path
-           to where it should go in git.  The prefixes are either
-           self.depotPaths, or self.branchPrefixes in the case of
-           branch detection."""
-
-        if self.useClientSpec:
-            # branch detection moves files up a level (the branch name)
-            # from what client spec interpretation gives
-            path = self.clientSpecDirs.map_in_client(path)
-            if self.detectBranches:
-                for b in self.knownBranches:
-                    if path.startswith(b + "/"):
-                        path = path[len(b)+1:]
-
-        elif self.keepRepoPath:
-            # Preserve everything in relative path name except leading
-            # //depot/; just look at first prefix as they all should
-            # be in the same depot.
-            depot = re.sub("^(//[^/]+/).*", r'\1', prefixes[0])
-            if p4PathStartsWith(path, depot):
-                path = path[len(depot):]
-
-        else:
-            for p in prefixes:
-                if p4PathStartsWith(path, p):
-                    path = path[len(p):]
-                    break
-
-        path = wildcard_decode(path)
-        return path
-
     def splitFilesIntoBranches(self, commit):
         """Look at each depotFile in the commit to figure out to what
            branch it belongs."""
@@ -2542,10 +2596,7 @@ class P4Sync(Command, P4UserMap):
 
             # start with the full relative path where this file would
             # go in a p4 client
-            if self.useClientSpec:
-                relPath = self.clientSpecDirs.map_in_client(path)
-            else:
-                relPath = self.stripRepoPath(path, self.depotPaths)
+            relPath = self.make_rel_path_ignoring_branch_mapping(path)
 
             for branch in self.knownBranches.keys():
                 # add a trailing slash so that a commit into qt/4.2foo
@@ -2581,20 +2632,16 @@ class P4Sync(Command, P4UserMap):
     # - helper for streamP4Files
 
     def streamOneP4File(self, file, contents):
-        relPath = self.stripRepoPath(file['depotFile'], self.branchPrefixes)
+        relPath = self.strip_repo_path(file['depotFile'])
         relPath = self.encodeWithUTF8(relPath)
         if verbose:
             size = int(self.stream_file['fileSize'])
             sys.stdout.write('\r%s --> %s (%i MB)\n' % (file['depotFile'], relPath, size/1024/1024))
             sys.stdout.flush()
 
-        (type_base, type_mods) = split_p4_type(file["type"])
+        (type_base, type_mods, git_mode) = split_p4_type(file["type"])
 
-        git_mode = "100644"
-        if "x" in type_mods:
-            git_mode = "100755"
         if type_base == "symlink":
-            git_mode = "120000"
             # p4 print on a symlink sometimes contains "target\n";
             # if it does, remove the newline
             data = ''.join(contents)
@@ -2661,7 +2708,7 @@ class P4Sync(Command, P4UserMap):
         self.writeToGitStream(git_mode, relPath, contents)
 
     def streamOneP4Deletion(self, file):
-        relPath = self.stripRepoPath(file['path'], self.branchPrefixes)
+        relPath = self.strip_repo_path(file['path'])
         relPath = self.encodeWithUTF8(relPath)
         if verbose:
             sys.stdout.write("delete %s\n" % relPath)
@@ -3355,8 +3402,8 @@ class P4Sync(Command, P4UserMap):
         else:
             if gitConfigBool("git-p4.useclientspec"):
                 self.useClientSpec = True
-        if self.useClientSpec:
-            self.clientSpecDirs = getClientSpec()
+
+        P4ToGitPathOptions.run(self)
 
         # TODO: should always look at previous commits,
         # merge with previous imports, if possible.
@@ -3767,6 +3814,315 @@ class P4Branches(Command):
             print "%s <= %s (%s)" % (branch, ",".join(settings["depot-paths"]), settings["change"])
         return True
 
+class P4MakePatch(Command, P4UserMap, P4ToGitPathOptions):
+    """ Create a git-compatible patch from a P4 changelist using "p4 describe"
+
+        "p4 describe" isn't very happy about dealing with binary files: if the file type
+        is "text" then it outputs any binary deltas as plain text (ASCII?) while if
+        it the file is binary, "p4 describe" doesn't output anything at all.
+    """
+
+    def __init__(self):
+        Command.__init__(self)
+        P4UserMap.__init__(self)
+        P4ToGitPathOptions.__init__(self)
+        self.options = [
+            optparse.make_option("--output", dest="output",
+                help="output directory for patches, if not specified, uses stdout"),
+            optparse.make_option("--use-client-spec", dest="useClientSpec",
+                help="map files based on the client spec", action="store_true"),
+            optparse.make_option("--depot-root", dest="depotRoot",
+                help="use this as the root portion of the depot path, instead of trying to infer from git history or P4 client"),
+        ]
+        self.depotRoot = None
+        self.description = ("Generate a git-compatible patch for each changelist (shelved or submitted)")
+        self.verbose = False
+        self.output = None
+        self.branchPrefixes = [] # no branch support at present
+        self.needsGit = False # can just generate a standalone patch
+
+    def run(self, args):
+        if len(args) < 1:
+            return False
+
+        if gitConfigBool("git-p4.useclientspec"):
+            self.useClientSpec = True
+
+        if self.output and not os.path.isdir(self.output):
+            os.makedirs(self.output, 0755)
+
+        P4ToGitPathOptions.run(self)
+
+        self.loadUserMapFromCache()
+
+        # Figure out where the root of the tree is in the depot.
+        #
+        # Either use the client spec if we have it, or use the
+        # depot-paths text from the existing git-log.
+        if self.depotRoot:
+            if not self.depotRoot.endswith("/"):
+                self.depotRoot += "/"
+            self.branchPrefixes = [self.depotRoot]
+
+        elif not self.useClientSpec:
+            log = extractLogMessageFromGitCommit('HEAD')
+            settings = extractSettingsGitLog(log)
+            if not 'depot-paths' in settings:
+                sys.exit("could not find depot-paths from git history and no client-spec specified")
+
+            self.depotPaths = settings['depot-paths']
+            self.branchPrefixes = self.depotPaths
+
+        for change in args:
+            try:
+                c = int(change)
+            except ValueError:
+                sys.exit("invalid changelist %s" % change)
+
+            self.make_patch(c)
+
+        return True
+
+    def extract_files_from_commit(self, commit):
+        files = []
+        fnum = 0
+        while commit.has_key("depotFile%s" % fnum):
+            p4file = P4FileInfo(commit, fnum)
+
+            if not p4file.is_text() and not p4file.is_symlink() and not p4file.is_binary():
+                sys.stderr.write("WARNING: skipping %s file %s\n" % (p4file.filetype(), p4file.path()))
+                fnum = fnum + 1
+                continue
+
+            files.append(p4file)
+            fnum = fnum + 1
+        return files
+
+    def header_lines(self, p4file):
+        """ Return the git diff format header lines for a given change
+        """
+        ret = ""
+        filetype = p4file.filetype()
+        (type_base, type_mods, git_mode) = split_p4_type(filetype)
+
+        if p4file.is_add():
+            ret += "new file mode %s\n" % git_mode
+        elif p4file.is_delete():
+            ret += "deleted file mode %s\n" % git_mode
+
+        return ret
+
+    def p4_fetch_delta(self, change, shelved=False):
+        """ Return the diff portion from "p4 describe".
+
+            Notes:
+            1. p4 does not return this when using the "-G" python-mode, so
+            we have to do this using regular text parsing
+
+            2. Binary files are not output at all
+
+            3. New files are also not output
+        """
+        cmd = ["describe"]
+        if shelved:
+            cmd += ["-S"]
+        cmd += ["-du"]
+        cmd += ["%s" % change]
+        cmd = p4_build_cmd(cmd)
+
+        p4 = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE)
+        result = None
+        in_diff = False
+        matcher = re.compile('====\s+(.*)#(\d+)\s+\((text|binary)\)\s+====')
+        delta = ""
+        skip_next_blank_line = False
+
+        try:
+
+            for line in p4.stdout.readlines():
+
+                if line.rstrip() == "Differences ...":
+                    in_diff = True
+                    continue
+
+                if in_diff:
+
+                    if skip_next_blank_line and \
+                        line.rstrip() == "":
+                        skip_next_blank_line = False
+                        continue
+
+                    m = matcher.match(line)
+                    if m:
+                        full_path = m.group(1)
+                        ver       = m.group(2)
+                        filetype  = m.group(3)
+                        if filetype == 'binary':
+                            continue
+
+                        relPath = "/" + self.strip_repo_path(full_path)
+                        delta += "diff --git a%s b%s\n" % (relPath, relPath)
+                        delta += "--- a%s\n" % relPath
+                        delta += "+++ b%s\n" % relPath
+                        skip_next_blank_line = True
+                    else:
+                        delta += line
+
+            delta += "\n"
+            exitCode = p4.wait()
+            if exitCode != 0:
+                raise IOError("p4 '%s' command failed" % str(cmd))
+
+        except EOFError:
+            # end of file
+            pass
+
+        return delta
+
+    def is_pending(self, description):
+        return description['status'] == 'pending'
+
+    def make_patch(self, change):
+        """ Generate a git-format patch for the given changelist.
+            For changes to existing files, use "p4 describe". For
+            deletions and additions, fetch the content.
+
+            This is _much_ slower than the normal sync method.
+        """
+
+        description = p4_describe(change)
+        shelved = False
+        if self.is_pending(description):
+            shelved = True
+            description = p4_describe(change, shelved=shelved)
+
+        userid = description["user"]
+        from_name = self.getP4UsernameEmail(userid)
+
+        if not from_name:
+            from_name = "unknown"
+
+        desc = description["desc"]
+        desc_lines = desc.split('\n')
+        subject = desc_lines[0].lstrip("\t")
+
+        comment = ""
+        for l in desc_lines[1:]:
+            comment += "%s\n" % l.lstrip("\t")
+
+        commit_date = time.strftime("%c %z", time.gmtime(int(description["time"])))
+
+        # try to emulate the stgit patch format
+        delta  = "commit %s\n\n" % change
+        delta += "From: %s\n" % from_name
+        delta += "Date: %s\n" % commit_date
+        delta += "Subject: [PATCH] %s\n\n" % subject
+        delta += comment
+        delta += "---\n"
+
+        files = self.extract_files_from_commit(description)
+        if self.clientSpecDirs:
+            self.clientSpecDirs.update_client_spec_path_cache(files)
+
+        # add modified files, just patching up the diff provided
+        # by "p4 describe"
+
+        delta += self.p4_fetch_delta(change, shelved)
+
+        # add new, deleted and binary files - these are not reported
+        # by p4 describe
+        for p4file in files:
+            full_path = p4file.path()
+            relPath = "/" + self.strip_repo_path(full_path)
+
+            if verbose:
+                print("converted path %s to depot-relative path %s" % (p4file.path(), relPath))
+
+            add = p4file.is_add()
+            delete = p4file.is_delete()
+            symlink = p4file.is_symlink()
+            binary_edit = p4file.is_binary() and p4file.is_edited()
+            rev = p4file.rev()
+            no_newline = "\No newline at end of file\n"
+
+            if add or delete:
+                if add:
+                    before = "/dev/null"
+                    after = "b%s" % relPath
+                else:
+                    before = "a%s" % relPath
+                    after = "/dev/null"
+
+                delta += "diff --git %s %s\n" % (before, after)
+                delta += self.header_lines(p4file)
+                delta += "--- %s\n" % before
+                delta += "+++ %s\n" % after
+
+                if add:
+                    prefix = "+"
+                else:
+                    prefix = "-"
+
+                if delete:
+                    if shelved:
+                        path_rev = "%s#%d" % (full_path, rev)
+                    else:
+                        path_rev = "%s#%d" % (full_path, rev-1)
+                else:
+                    # added
+                    if shelved:
+                        path_rev = "%s@=%d" % (full_path, change)
+                    else:
+                        path_rev = "%s@%d" % (full_path, change)
+
+                (lines, delta_content) = self.read_file_contents(prefix, path_rev)
+                if symlink:
+                    delta_content += no_newline
+                if p4file.is_binary():
+                    delta_content += "\n" + no_newline
+
+                if add:
+                    if lines > 0:
+                        delta += "@@ -0,0 +1,%d @@\n" % lines
+                else:
+                    delta += "@@ -1,%d +0,0 @@\n" % lines
+
+                delta += delta_content
+
+            if binary_edit:
+                delta += "diff --git a%s b%s\n" % (relPath, relPath)
+                delta += self.header_lines(p4file)
+                delta += "--- a%s\n" % relPath
+                delta += "+++ b%s\n" % relPath
+
+                if shelved:
+                    path_rev = "%s@=%d" % (full_path, rev)
+                else:
+                    path_rev = "%s#%d" % (full_path, rev)
+                (old_lines, old_delta_content) = self.read_file_contents("-", path_rev)
+                old_delta_content += "\n" + no_newline
+                (new_lines, new_delta_content) = self.read_file_contents("+", path_rev)
+                new_delta_content += "\n" + no_newline
+
+                delta += "@@ -0,%d +0,%d @@\n" % (old_lines, new_lines)
+                delta += old_delta_content
+                delta += new_delta_content
+
+        if self.output:
+            with open("%s/%s.patch" % (self.output, change), "w") as f:
+                f.write(delta)
+        else:
+            print(delta)
+
+    def read_file_contents(self, prefix, path_rev):
+        delta_content = ""
+        lines = 0
+        for line in p4_read_pipe_lines(["print", "-q", "-k", path_rev]):
+            delta_content += "%s%s" % (prefix, line)
+            lines += 1
+
+        return (lines, delta_content)
+
 class HelpFormatter(optparse.IndentedHelpFormatter):
     def __init__(self):
         optparse.IndentedHelpFormatter.__init__(self)
@@ -3793,7 +4149,8 @@ commands = {
     "rebase" : P4Rebase,
     "clone" : P4Clone,
     "rollback" : P4RollBack,
-    "branches" : P4Branches
+    "branches" : P4Branches,
+    "format-patch" : P4MakePatch,
 }
 
 
