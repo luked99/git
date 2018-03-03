@@ -50,6 +50,32 @@ defaultLabelRegexp = r'[a-zA-Z0-9_\-.]+$'
 # Grab changes in blocks of this many revisions, unless otherwise requested
 defaultBlockSize = 512
 
+class P4FileInfo(dict):
+    """ helper class for dealing with dictionaries of Perforce file info
+        fields in the <field><revision> format, such as "depotFile42".
+    """
+    def __init__(self, commit, fnum):
+        self['path']     = commit["depotFile%s" % fnum]
+        self['action']   = commit["action%s" % fnum]
+        self['type']     = commit["type%s" % fnum]
+
+        rev = commit["rev%s" % fnum]
+        if rev == 'none':
+            self['rev'] = None          # shelved changelist
+        else:
+            self['rev'] = int(rev)
+
+    def path(self): return self['path']
+    def rev(self): return self['rev']
+    def action(self): return self['action']
+    def filetype(self): return self['type']
+
+    def is_text(self): return self.filetype() == "text"
+    def is_symlink(self): return self.filetype() == "symlink"
+
+    def is_add(self): return self.action() == "add"
+    def is_delete(self): return self.action() == "delete"
+
 def p4_build_cmd(cmd):
     """Build a suitable p4 command line.
 
@@ -2447,12 +2473,8 @@ class P4Sync(Command, P4UserMap):
                 fnum = fnum + 1
                 continue
 
-            file = {}
-            file["path"] = path
-            file["rev"] = commit["rev%s" % fnum]
-            file["action"] = commit["action%s" % fnum]
-            file["type"] = commit["type%s" % fnum]
-            files.append(file)
+            p4file = P4FileInfo(commit, fnum)
+            files.append(p4file)
             fnum = fnum + 1
         return files
 
@@ -2515,11 +2537,7 @@ class P4Sync(Command, P4UserMap):
                 fnum = fnum + 1
                 continue
 
-            file = {}
-            file["path"] = path
-            file["rev"] = commit["rev%s" % fnum]
-            file["action"] = commit["action%s" % fnum]
-            file["type"] = commit["type%s" % fnum]
+            p4file = P4FileInfo(commit, fnum)
             fnum = fnum + 1
 
             # start with the full relative path where this file would
@@ -2535,7 +2553,7 @@ class P4Sync(Command, P4UserMap):
                 if relPath.startswith(branch + "/"):
                     if branch not in branches:
                         branches[branch] = []
-                    branches[branch].append(file)
+                    branches[branch].append(p4file)
                     break
 
         return branches
