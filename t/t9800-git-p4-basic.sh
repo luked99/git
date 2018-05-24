@@ -297,8 +297,22 @@ test_expect_success 'submit from worktree' '
 	)
 '
 
+test_expect_success 'error handling' '
+	test_when_finished cleanup_git &&
+	(
+		P4PORT=: test_must_fail git p4 clone //depot/foo 2>errmsg &&
+		grep -q "failure accessing depot" errmsg
+	) &&
+	p4 passwd -P newpassword &&
+	(
+		P4PASSWD=badpassword test_must_fail git p4 clone //depot/foo 2>errmsg &&
+		grep -q "failure accessing depot.*P4PASSWD" errmsg
+	)
+'
+
 test_expect_success 'kill p4d' '
 	kill_p4d
 '
+
 
 test_done

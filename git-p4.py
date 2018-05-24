@@ -26,6 +26,7 @@ import zipfile
 import zlib
 import ctypes
 import errno
+import exceptions
 
 try:
     from subprocess import CalledProcessError
@@ -263,6 +264,54 @@ def p4_system(cmd):
     retcode = subprocess.call(real_cmd, shell=expand)
     if retcode:
         raise CalledProcessError(retcode, real_cmd)
+
+def die_bad_access(s):
+    die("failure accessing depot: {0}".format(s.rstrip()))
+
+def p4_check_access():
+    """ Check if we can access Perforce
+
+        - p4 not in path
+        - P4PORT not set or invalid - won't get back any marshalled data
+        - not logged in
+    """
+    try:
+        results = p4CmdList(["login", "-s"])
+    except exceptions.OSError as e:
+        die_bad_access("could not run p4: {0.strerror}".format(e))
+    except exceptions.ValueError as e:
+        # junk in the marshalled output
+        die_bad_access("could not unmarshal p4 output: {0}".format(e))
+
+    if len(results) == 0:
+        die_bad_access("could not parse response from perforce")
+
+    result = results[0]
+
+    expiry = result.get("TicketExpiration")
+    if expiry:
+        expiry = int(expiry)
+        if expiry > 1:
+            # ok to carry on
+            return
+        else:
+            die_bad_access("perforce ticket expires in {0} seconds".format(expiry))
+
+    code = result.get("code")
+    if not code:
+        # we get here if p4 can't talk to the server
+        die_bad_access("unexpected response from p4 - is P4PORT set?")
+
+    if code == "stat":
+        pass
+    elif code == "error":
+        data = result.get("data")
+        if data:
+            die_bad_access("p4 error: {0}".format(data))
+        else:
+            die_bad_access("unknown error")
+    else:
+        die_bad_access("unknown error code {0}".format(code))
 
 _p4_version_string = None
 def p4_version_string():
@@ -3971,6 +4020,8 @@ def main():
 
         # so git commands invoked from the P4 workspace will succeed
         os.environ["GIT_DIR"] = cmd.gitdir
+
+    p4_check_access()
 
     if not cmd.run(args):
         parser.print_help()
