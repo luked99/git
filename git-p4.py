@@ -2592,8 +2592,8 @@ class P4Sync(Command, P4UserMap):
 
     # Force a checkpoint in fast-import and wait for it to finish
     def checkpoint(self):
-        self.gitStream.write("checkpoint\n\n")
-        self.gitStream.write("progress checkpoint\n\n")
+        self.writeGitStream("checkpoint\n\n")
+        self.writeGitStream("progress checkpoint\n\n")
         out = self.gitOutput.readline()
         if self.verbose:
             print("checkpoint finished: " + out)
@@ -2736,11 +2736,11 @@ class P4Sync(Command, P4UserMap):
         return branches
 
     def writeToGitStream(self, gitMode, relPath, contents):
-        self.gitStream.write('M %s inline %s\n' % (gitMode, relPath))
-        self.gitStream.write('data %d\n' % sum(len(d) for d in contents))
+        self.writeGitStream('M %s inline %s\n' % (gitMode, relPath))
+        self.writeGitStream('data %d\n' % sum(len(d) for d in contents))
         for d in contents:
-            self.gitStream.write(d)
-        self.gitStream.write('\n')
+            self.gitStream.write(d) # don't encode the raw data
+        self.writeGitStream('\n')
 
     def encodeWithUTF8(self, path):
         try:
@@ -2843,7 +2843,7 @@ class P4Sync(Command, P4UserMap):
         if verbose:
             sys.stdout.write("delete %s\n" % relPath)
             sys.stdout.flush()
-        self.gitStream.write("D %s\n" % relPath)
+        self.writeGitStream("D %s\n" % relPath)
 
         if self.largeFileSystem and self.largeFileSystem.isLargeFile(relPath):
             self.largeFileSystem.removeLargeFile(relPath)
@@ -2872,8 +2872,8 @@ class P4Sync(Command, P4UserMap):
                     f = self.stream_file["depotFile"]
             # force a failure in fast-import, else an empty
             # commit will be made
-            self.gitStream.write("\n")
-            self.gitStream.write("die-now\n")
+            self.writeGitStream("\n")
+            self.writeGitStream("die-now\n")
             self.gitStream.close()
             # ignore errors, but make sure it exits first
             self.importProcess.wait()
@@ -2970,8 +2970,8 @@ class P4Sync(Command, P4UserMap):
 
         if verbose:
             print("writing tag %s for commit %s" % (labelName, commit))
-        gitStream.write("tag %s\n" % labelName)
-        gitStream.write("from %s\n" % commit)
+        self.writeGitStream("tag %s\n" % labelName)
+        self.writeGitStream("from %s\n" % commit)
 
         if 'Owner' in labelDetails:
             owner = labelDetails["Owner"]
@@ -2986,7 +2986,7 @@ class P4Sync(Command, P4UserMap):
             email = self.make_email(self.p4UserId())
         tagger = "%s %s %s" % (email, epoch, self.tz)
 
-        gitStream.write("tagger %s\n" % tagger)
+        self.writeGitStream("tagger %s\n" % tagger)
 
         print("labelDetails=",labelDetails)
         if 'Description' in labelDetails:
@@ -2994,9 +2994,9 @@ class P4Sync(Command, P4UserMap):
         else:
             description = 'Label from git p4'
 
-        gitStream.write("data %d\n" % len(description))
-        gitStream.write(description)
-        gitStream.write("\n")
+        self.writeGitStream("data %d\n" % len(description))
+        self.writeGitStream(description)
+        self.writeGitStream("\n")
 
     def inClientSpec(self, path):
         if not self.clientSpecDirs:
@@ -3014,6 +3014,9 @@ class P4Sync(Command, P4UserMap):
         if not hasPrefix and self.verbose:
             print('Ignoring file outside of prefix: {0}'.format(path))
         return hasPrefix
+
+    def writeGitStream(self, s):
+        return self.gitStream.write(s.encode())
 
     def commit(self, details, files, branch, parent = ""):
         epoch = details["time"]
@@ -3034,37 +3037,37 @@ class P4Sync(Command, P4UserMap):
                 .format(details['change']))
             return
 
-        self.gitStream.write("commit %s\n" % branch)
-        self.gitStream.write("mark :%s\n" % details["change"])
+        self.writeGitStream("commit %s\n" % branch)
+        self.writeGitStream("mark :%s\n" % details["change"])
         self.committedChanges.add(int(details["change"]))
         committer = ""
         if author not in self.users:
             self.getUserMapFromPerforceServer()
         committer = "%s %s %s" % (self.make_email(author), epoch, self.tz)
 
-        self.gitStream.write("committer %s\n" % committer)
+        self.writeGitStream("committer %s\n" % committer)
 
-        self.gitStream.write("data <<EOT\n")
-        self.gitStream.write(details["desc"])
+        self.writeGitStream("data <<EOT\n")
+        self.writeGitStream(details["desc"])
         if len(jobs) > 0:
-            self.gitStream.write("\nJobs: %s" % (' '.join(jobs)))
+            self.writeGitStream("\nJobs: %s" % (' '.join(jobs)))
 
         if not self.suppress_meta_comment:
-            self.gitStream.write("\n[git-p4: depot-paths = \"%s\": change = %s" %
+            self.writeGitStream("\n[git-p4: depot-paths = \"%s\": change = %s" %
                                 (','.join(self.branchPrefixes), details["change"]))
             if len(details['options']) > 0:
-                self.gitStream.write(": options = %s" % details['options'])
-            self.gitStream.write("]\n")
+                self.writeGitStream(": options = %s" % details['options'])
+            self.writeGitStream("]\n")
 
-        self.gitStream.write("EOT\n\n")
+        self.writeGitStream("EOT\n\n")
 
         if len(parent) > 0:
             if self.verbose:
                 print("parent %s" % parent)
-            self.gitStream.write("from %s\n" % parent)
+            self.writeGitStream("from %s\n" % parent)
 
         self.streamP4Files(files)
-        self.gitStream.write("\n")
+        self.writeGitStream("\n")
 
         change = int(details["change"])
 
@@ -3330,7 +3333,7 @@ class P4Sync(Command, P4UserMap):
     def importNewBranch(self, branch, maxChange):
         # make fast-import flush all changes to disk and update the refs using the checkpoint
         # command so that we can try to find the branch parent in the git history
-        self.gitStream.write("checkpoint\n\n");
+        self.writeGitStream("checkpoint\n\n");
         self.gitStream.flush();
         branchPrefix = self.depotPaths[0] + branch + "/"
         range = "@1,%s" % maxChange
