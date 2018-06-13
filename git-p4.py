@@ -645,6 +645,63 @@ class P4RequestSizeException(P4ServerException):
 def isModeExecChanged(src_mode, dst_mode):
     return isModeExec(src_mode) != isModeExec(dst_mode)
 
+class PolyStringDict:
+    """ Like a regular dictionary, but automatically converts from bytes
+        to strings.
+
+        Values in the source dict are converted to strings, but keys remain as
+        bytes.
+    """
+
+    def __init__(self, d={}):
+        self.d = d
+
+    def __repr__(self):
+        return self.d.__repr__()
+
+    def __len__(self):
+        return d.len()
+
+    def __setitem__(self, key, value):
+        bkey = self._convert_key(key)
+        self.d[bkey] = value
+
+    def _convert_key(self, key):
+        if isinstance(key, bytes):
+            return key
+        else:
+            return key.encode(p4_encoding)
+
+    def __getitem__(self, key):
+        bkey = self._convert_key(key)
+        value = self.d[bkey]
+        if isinstance(value, bytes):
+            value = value.decode(p4_encoding)
+            self.d[bkey] = value
+        elif isinstance(value, dict):
+            value = PolyStringDict(value)
+            self.d[bkey] = value
+        return value
+
+    def __iter__(self):
+        return self.d.__iter__()
+
+    def __contains__(self, key):
+        bkey = self._convert_key(key)
+        return bkey in self.d
+
+    def get(self, key):
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return None
+
+    def keys(self):
+        return self.d.keys()
+
+    def has_key(self, key):
+        return self.__contains__(key)
+
 def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
         errors_as_exceptions=False):
 
