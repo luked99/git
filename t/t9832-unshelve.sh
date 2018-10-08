@@ -19,8 +19,10 @@ test_expect_success 'init depot' '
 		p4 add file1 &&
 		p4 submit -d "change 1" &&
 		: >file_to_delete &&
+		: >file_to_move &&
 		p4 add file_to_delete &&
-		p4 submit -d "file to delete"
+		p4 add file_to_move &&
+		p4 submit -d "add files to delete"
 	)
 '
 
@@ -36,6 +38,8 @@ test_expect_success 'create shelved changelist' '
 		echo "new file" >file2 &&
 		p4 add file2 &&
 		p4 delete file_to_delete &&
+		p4 edit file_to_move &&
+		p4 move file_to_move moved_file &&
 		p4 opened &&
 		p4 shelve -i <<EOF
 Change: new
@@ -47,6 +51,8 @@ Files:
 	//depot/file1
 	//depot/file2
 	//depot/file_to_delete
+	//depot/file_to_move
+	//depot/moved_file
 EOF
 
 	) &&
@@ -59,7 +65,9 @@ EOF
 		test_path_is_file file2 &&
 		test_cmp file1 "$cli"/file1 &&
 		test_cmp file2 "$cli"/file2 &&
-		test_path_is_missing file_to_delete
+		test_path_is_missing file_to_delete &&
+		test_path_is_missing file_to_move &&
+		test_path_is_file moved_file
 	)
 '
 
@@ -120,14 +128,14 @@ EOF
 	)
 '
 
-# Now try to unshelve it. git-p4 should refuse to do so.
+# Now try to unshelve it.
 test_expect_success 'try to unshelve the change' '
 	test_when_finished cleanup_git &&
 	(
 		change=$(last_shelved_change) &&
 		cd "$git" &&
-		test_must_fail git p4 unshelve $change 2>out.txt &&
-		grep -q "cannot unshelve" out.txt
+		git p4 unshelve $change >out.txt &&
+		grep -q "unshelved changelist $change" out.txt
 	)
 '
 
