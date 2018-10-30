@@ -27,6 +27,16 @@ import zlib
 import ctypes
 import errno
 
+# Python3 bytes vs string handling
+#
+# Perforce command output is actually ascii. Filenames are utf-8 and file
+# content are utf-8:
+#
+# https://community.perforce.com/s/article/3104
+
+p4_encoding = 'ascii'   # for command output
+git_encoding = 'utf8'
+
 # support basestring in python3
 try:
     unicode = unicode
@@ -36,12 +46,37 @@ except NameError:
     unicode = str
     bytes = bytes
     basestring = (str,bytes)
+
+    def from_git_string(o):
+        if isinstance(o, str):
+            return o
+        else:
+            return o.decode(git_encoding)
+
+    def to_p4_string(s):
+        assert isinstance(s, str), "expecting string not {}".format(s)
+        return s.encode(p4_encoding)
+
+    def from_p4_string(o):
+        if isinstance(o, str):
+            return o
+        else:
+            return o.decode(p4_encoding)
 else:
     # 'unicode' exists, must be Python 2
     str = str
     unicode = unicode
     bytes = str
     basestring = basestring
+
+    def to_p4_string(s):
+        return s
+
+    def from_p4_string(s):
+        return s
+
+    def from_git_string(s):
+        return s
 
 try:
     from subprocess import CalledProcessError
