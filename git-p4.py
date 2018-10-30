@@ -649,21 +649,31 @@ class PolyStringDict:
     """ Like a regular dictionary, but automatically converts from bytes
         to strings.
 
-        Values in the source dict are converted to strings, but keys remain as
-        bytes.
+        Keys and values are left as bytes in the original dictionary.
+
+        There is some special handling for some keys:
+
+        - data: assert if supplied with anything other than bytes
+        - depotPath: decode according to the git-p4.pathEncoding setting
+
+        FIXME: work with python2!!!
+
     """
 
     def __init__(self, d={}):
         self.d = d
+        self.str_keys = [k.decode(p4_encoding) for k in d.keys()]
 
     def __repr__(self):
-        return self.d.__repr__()
+        return "PolyStringDict({0})".format(self.d.__repr__())
 
     def __len__(self):
-        return d.len()
+        return self.d.__len__()
 
     def __setitem__(self, key, value):
         bkey = self._convert_key(key)
+        if bkey == b'data':
+            assert isinstance(value, bytes), "trying to replace binary data with a string!"
         self.d[bkey] = value
 
     def _convert_key(self, key):
@@ -672,16 +682,32 @@ class PolyStringDict:
         else:
             return key.encode(p4_encoding)
 
+    def _get_path(self, bkey):
+        """ For filenames we need to decode using the path encoding that has been configured.
+        """
+        path = self.d[bkey]
+        try:
+            result = path.decode('ascii')
+        except:
+            encoding = 'utf8'   # perforce encoding
+            if gitConfig('git-p4.pathEncoding'):
+                encoding = gitConfig('git-p4.pathEncoding')
+            result = path.decode(encoding, 'replace').encode('utf8', 'replace')
+            if self.verbose:
+                print('Path with non-ASCII characters detected. Used %s to encode: %s ' % (encoding, result))
+        return result
+
     def __getitem__(self, key):
         bkey = self._convert_key(key)
         value = self.d[bkey]
-        if isinstance(value, bytes):
-            value = value.decode(p4_encoding)
-            self.d[bkey] = value
-        elif isinstance(value, dict):
-            value = PolyStringDict(value)
-            self.d[bkey] = value
-        return value
+        if key == "depotFile":
+            return self._get_path(bkey)
+        else:
+            if isinstance(value, bytes):
+                value = value.decode(p4_encoding)
+            elif isinstance(value, dict):
+                value = PolyStringDict(value)
+            return value
 
     def __iter__(self):
         return self.d.__iter__()
@@ -691,16 +717,37 @@ class PolyStringDict:
         return bkey in self.d
 
     def get(self, key):
+        """ Return the value, converted from bytes to string """
         try:
             return self.__getitem__(key)
         except KeyError:
             return None
 
+    def get_raw(self, key):
+        """ Return the raw data """
+        bkey = self._convert_key(key)
+        result = self.d[bkey]
+        assert isinstance(result, bytes), "raw data '{0}' in {1} is a string!".format(result, self)
+        return result
+
     def keys(self):
-        return self.d.keys()
+        """ Return keys converted to strings """
+        return self.str_keys
 
     def has_key(self, key):
         return self.__contains__(key)
+
+    def values(self):
+        return [self.__getitem__(k) for k in self.d]
+
+    def items(self):
+        """ Emultate dict.items(). Not very efficient but probably doesn't matter. """
+        result = []
+        for k in self.keys():
+            v = self.__getitem__(k)
+            result.append((k, v))
+
+        return result
 
 def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
         errors_as_exceptions=False):
@@ -742,6 +789,7 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
             if skip_info:
                 if 'code' in entry and entry['code'] == 'info':
                     continue
+            entry = PolyStringDict(entry)
             if cb is not None:
                 cb(entry)
             else:
@@ -2840,24 +2888,11 @@ class P4Sync(Command, P4UserMap):
             self.gitStream.write(d) # don't encode the raw data
         self.writeGitStream('\n')
 
-    def encodeWithUTF8(self, path):
-        try:
-            path.decode('ascii')
-        except:
-            encoding = 'utf8'
-            if gitConfig('git-p4.pathEncoding'):
-                encoding = gitConfig('git-p4.pathEncoding')
-            path = path.decode(encoding, 'replace').encode('utf8', 'replace')
-            if self.verbose:
-                print('Path with non-ASCII characters detected. Used %s to encode: %s ' % (encoding, path))
-        return path
-
     # output one file from the P4 stream
     # - helper for streamP4Files
 
     def streamOneP4File(self, file, contents):
         relPath = self.stripRepoPath(file['depotFile'], self.branchPrefixes)
-        relPath = self.encodeWithUTF8(relPath)
         if verbose:
             size = int(self.stream_file['fileSize'])
             sys.stdout.write('\r%s --> %s (%i MB)\n' % (file['depotFile'], relPath, size/1024/1024))
