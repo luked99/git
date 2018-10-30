@@ -58,6 +58,12 @@ except ImportError:
         def __str__(self):
             return "Command '%s' returned non-zero exit status %d" % (self.cmd, self.returncode)
 
+# raw_input was renamed to input in python3
+try:
+    type(raw_input)
+except NameError:
+    raw_input = input        # python3
+
 verbose = False
 
 # Only labels/tags matching this will be imported/exported
