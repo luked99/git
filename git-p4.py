@@ -12,6 +12,10 @@ if sys.hexversion < 0x02060000:
     # The limiter is the subprocess module
     sys.stderr.write("git-p4: requires Python 2.6 or later.\n")
     sys.exit(1)
+if sys.version_info.major == 3 and sys.version_info.minor < 5:
+    sys.stderr.write("git-p4: requires Python 3.5 or later.\n")
+    sys.exit(1)
+
 import os
 import optparse
 import marshal
