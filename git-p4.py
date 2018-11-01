@@ -167,7 +167,7 @@ def git_dir(path):
     """ Return TRUE if the given path is a git directory (/path/to/dir/.git).
         This won't automatically add ".git" to a directory.
     """
-    d = read_pipe(["git", "--git-dir", path, "rev-parse", "--git-dir"], True).strip()
+    d = git_read_pipe(["--git-dir", path, "rev-parse", "--git-dir"], ignore_error=True)
     if not d or len(d) == 0:
         return None
     else:
@@ -230,16 +230,19 @@ def p4_write_pipe(c, stdin):
     real_cmd = p4_build_cmd(c)
     return write_pipe(real_cmd, stdin)
 
-def read_pipe_full(c):
+def read_pipe_full(c, **kwargs):
     """ Read output from  command. Returns a tuple
         of the return status, stdout text and stderr
         text.
+
+        Cannot use subprocess options for encoding handling as they are only supported from
+        Python3.6 onwards.
     """
     if verbose:
         sys.stderr.write('Reading pipe: %s\n' % str(c))
 
     expand = isinstance(c,basestring)
-    p = subprocess.Popen(c, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=expand)
+    p = subprocess.Popen(c, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=expand, **kwargs)
     (out, err) = p.communicate()
     return (p.returncode, out, err)
 
@@ -256,37 +259,42 @@ def read_pipe(c, ignore_error=False):
             die('Command failed: %s\nError: %s' % (str(c), err))
     return out
 
-def read_pipe_text(c):
-    """ Read output from a command with trailing whitespace stripped.
-        On error, returns None.
+def git_read_pipe(c, ignore_error=False)
+    """ Execute git command, strip trailing space, and return string result, decoding from utf-8.
+        Return None on error.
     """
-    (retcode, out, err) = read_pipe_full(c)
+    assert c[0] != "git", "git git makes no sense"
+    (retcode, out, err) = read_pipe_full(["git"] + c, **kwargs)
     if retcode != 0:
-        return None
+        if ignore_error:
+            return ""
+        else:
+            die('Command failed: %s\nError: %s' % (str(c), err))
     else:
-        return out.rstrip()
+        return from_git_string(out).strip()
 
-def p4_read_pipe(c, ignore_error=False):
+def git_read_pipe_no_error(c):
+    return git_read_pipe(c, ignore_error=True)
+
+def p4_read_pipe(c):
+    assert c[0] != "p4", "p4 p4 makes no sense"
     real_cmd = p4_build_cmd(c)
-    return read_pipe(real_cmd, ignore_error)
+    return read_pipe(real_cmd)
 
-def read_pipe_lines(c):
-    if verbose:
-        sys.stderr.write('Reading pipe: %s\n' % str(c))
-
-    expand = isinstance(c, basestring)
-    p = subprocess.Popen(c, stdout=subprocess.PIPE, shell=expand)
+def convert_subprocess_stdout(cmd, converter):
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     pipe = p.stdout
-    val = pipe.readlines()
+    val = [converter(l) for l in pipe]
     if pipe.close() or p.wait():
         die('Command failed: %s' % str(c))
-
     return val
 
+def git_read_pipe_lines(c):
+    return convert_subprocess_stdout(["git"] + c)
+
 def p4_read_pipe_lines(c):
-    """Specifically invoke p4 on the command supplied. """
     real_cmd = p4_build_cmd(c)
-    return read_pipe_lines(real_cmd)
+    return convert_subprocess_stdout(real_cmd)
 
 def p4_has_command(cmd):
     """Ask p4 for help on this command.  If it returns an error, the
@@ -309,9 +317,9 @@ def p4_has_move_command():
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     (out, err) = p.communicate()
     # return code will be 1 in either case
-    if err.find("Invalid option") >= 0:
+    if err.find(b"Invalid option") >= 0:
         return False
-    if err.find("disabled") >= 0:
+    if err.find(b"disabled") >= 0:
         return False
     # assume it failed because @... was invalid changelist
     return True
@@ -556,6 +564,7 @@ def getP4OpenedType(file):
     # Returns the perforce file type for the given file.
 
     result = p4_read_pipe(["opened", wildcard_encode(file)])
+    result = from_p4_string(result)
     match = re.match(".*\((.+)\)( \*exclusive\*)?\r?$", result)
     if match:
         return match.group(1)
@@ -577,7 +586,7 @@ def getP4Labels(depotPaths):
 # Return the set of all git tags
 def getGitTags():
     gitTags = set()
-    for line in read_pipe_lines(["git", "tag"]):
+    for line in git_read_pipe_lines(["tag"]):
         tag = line.strip()
         gitTags.add(tag)
     return gitTags
@@ -773,11 +782,11 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None, skip_info=False,
     stdin_file = None
     if stdin is not None:
         stdin_file = tempfile.TemporaryFile(prefix='p4-stdin', mode=stdin_mode)
-        if isinstance(stdin,basestring):
+        if isinstance(stdin, basestring):
             stdin_file.write(stdin)
         else:
             for i in stdin:
-                stdin_file.write(i + '\n')
+                stdin_file.write((i + '\n').encode(p4_encoding))
         stdin_file.flush()
         stdin_file.seek(0)
 
@@ -867,25 +876,25 @@ def p4Where(depotPath):
     return clientPath
 
 def currentGitBranch():
-    return read_pipe_text(["git", "symbolic-ref", "--short", "-q", "HEAD"])
+    return git_read_pipe(["symbolic-ref", "--short", "-q", "HEAD"])
 
 def isValidGitDir(path):
     return git_dir(path) != None
 
 def parseRevision(ref):
-    return read_pipe("git rev-parse %s" % ref).strip()
+    return git_read_pipe_text(["rev-parse", ref])
 
 def branchExists(ref):
-    rev = read_pipe(["git", "rev-parse", "-q", "--verify", ref],
-                     ignore_error=True)
-    return len(rev) > 0
+    rev = git_read_pipe_text(["rev-parse", "-q", "--verify", ref], ignore_error=True)
+    return rev != None
 
 def extractLogMessageFromGitCommit(commit):
+    assert isinstance(commit, str), "expecting str not bytes"
     logMessage = ""
 
     ## fixme: title is first line of commit, not 1st paragraph.
     foundTitle = False
-    for log in read_pipe_lines("git cat-file commit %s" % commit):
+    for log in git_read_pipe_lines(["cat-file", "commit", commit]):
        if not foundTitle:
            if len(log) == 1:
                foundTitle = True
@@ -920,26 +929,29 @@ def extractSettingsGitLog(log):
     return values
 
 def gitBranchExists(branch):
+    assert isinstance(branch, str), "expecting string, not bytes"
     proc = subprocess.Popen(["git", "rev-parse", branch],
                             stderr=subprocess.PIPE, stdout=subprocess.PIPE);
     return proc.wait() == 0;
 
 def gitUpdateRef(ref, newvalue):
+    assert isinstance(branch, str), "expecting string, not bytes"
     subprocess.check_call(["git", "update-ref", ref, newvalue])
 
 def gitDeleteRef(ref):
+    assert isinstance(branch, str), "expecting string, not bytes"
     subprocess.check_call(["git", "update-ref", "-d", ref])
 
 _gitConfig = {}
 
 def gitConfig(key, typeSpecifier=None):
     if key not in _gitConfig:
-        cmd = [ "git", "config" ]
+        cmd = [ "config" ]
         if typeSpecifier:
             cmd += [ typeSpecifier ]
         cmd += [ key ]
-        s = read_pipe(cmd, ignore_error=True)
-        _gitConfig[key] = s.strip()
+        s = git_read_pipe_no_error(cmd)
+        _gitConfig[key] = s
     return _gitConfig[key]
 
 def gitConfigBool(key):
@@ -953,9 +965,8 @@ def gitConfigBool(key):
 
 def gitConfigInt(key):
     if key not in _gitConfig:
-        cmd = [ "git", "config", "--int", key ]
-        s = read_pipe(cmd, ignore_error=True)
-        v = s.strip()
+        cmd = [ "config", "--int", key ]
+        v = git_read_pipe_no_error(cmd)
         try:
             _gitConfig[key] = int(gitConfig(key, '--int'))
         except ValueError:
@@ -964,8 +975,8 @@ def gitConfigInt(key):
 
 def gitConfigList(key):
     if key not in _gitConfig:
-        s = read_pipe(["git", "config", "--get-all", key], ignore_error=True)
-        _gitConfig[key] = s.strip().splitlines()
+        s = read_pipe_no_error(["config", "--get-all", key])
+        _gitConfig[key] = s.splitlines()
         if _gitConfig[key] == ['']:
             _gitConfig[key] = []
     return _gitConfig[key]
@@ -979,14 +990,14 @@ def p4BranchesInGit(branchesAreInRemotes=True):
 
     branches = {}
 
-    cmdline = "git rev-parse --symbolic "
+    cmdline = ["rev-parse", "--symbolic"]
     if branchesAreInRemotes:
-        cmdline += "--remotes"
+        cmdline += ["--remotes"]
     else:
-        cmdline += "--branches"
+        cmdline += ["--branches"]
 
-    for line in read_pipe_lines(cmdline):
-        line = line.strip()
+    for line in git_read_pipe_lines(cmdline):
+        line = from_git_string(line).strip()
 
         # only import to p4/
         if not line.startswith('p4/'):
@@ -1011,7 +1022,7 @@ def branch_exists(branch):
     if p.returncode:
         return False
     # expect exactly one line of output: the branch name
-    return out.rstrip() == branch
+    return from_git_string(out).rstrip() == branch
 
 def findUpstreamBranchPoint(head = "HEAD"):
     branches = p4BranchesInGit()
@@ -1047,8 +1058,7 @@ def createOrUpdateBranchesFromOrigin(localRefPrefix = "refs/remotes/p4/", silent
 
     originPrefix = "origin/p4/"
 
-    for line in read_pipe_lines("git rev-parse --symbolic --remotes"):
-        line = line.strip()
+    for line in git_read_pipe_lines(["rev-parse", "--symbolic", "--remotes"]):
         if (not line.startswith(originPrefix)) or line.endswith("HEAD"):
             continue
 
@@ -1521,7 +1531,7 @@ class P4UserMap:
         for (key, val) in self.users.items():
             s += "%s\t%s\n" % (key.expandtabs(1), val.expandtabs(1))
 
-        open(self.getUserCacheFilename(), "wb").write(s)
+        open(self.getUserCacheFilename(), "wb").write(s.encode('utf-8'))
         self.userMapFromPerforceServer = True
 
     def loadUserMapFromCache(self):
@@ -1532,6 +1542,7 @@ class P4UserMap:
             lines = cache.readlines()
             cache.close()
             for line in lines:
+                line = line.decode('utf-8')
                 entry = line.strip().split("\t")
                 self.users[entry[0]] = entry[1]
         except IOError:
@@ -1571,10 +1582,10 @@ class P4RollBack(Command):
 
         if self.rollbackLocalBranches:
             refPrefix = "refs/heads/"
-            lines = read_pipe_lines("git rev-parse --symbolic --branches")
+            lines = git_read_pipe_lines(["rev-parse", "--symbolic", "--branches"])
         else:
             refPrefix = "refs/remotes/"
-            lines = read_pipe_lines("git rev-parse --symbolic --remotes")
+            lines = git_read_pipe_lines(["rev-parse", "--symbolic", "--remotes"])
 
         for line in lines:
             if self.rollbackLocalBranches or (line.startswith("p4/") and line != "p4/HEAD\n"):
@@ -1751,8 +1762,7 @@ class P4Submit(Command, P4UserMap):
     def p4UserForCommit(self,id):
         # Return the tuple (perforce user,git email) for a given git commit id
         self.getUserMapFromPerforceServer()
-        gitEmail = read_pipe(["git", "log", "--max-count=1",
-                              "--format=%ae", id])
+        gitEmail = git_read_pipe(["log", "--max-count=1", "--format=%ae", id])
         gitEmail = gitEmail.strip()
         if gitEmail not in self.emails:
             return (None,gitEmail)
@@ -1863,7 +1873,7 @@ class P4Submit(Command, P4UserMap):
                 break
         if not change_entry:
             die('Failed to decode output of p4 change -o')
-        for key, value in change_entry.iteritems():
+        for key, value in change_entry.items():
             if key.startswith('File'):
                 if 'depot-paths' in settings:
                     if not [p for p in settings['depot-paths']
@@ -1907,7 +1917,7 @@ class P4Submit(Command, P4UserMap):
         if "P4EDITOR" in os.environ and (os.environ.get("P4EDITOR") != ""):
             editor = os.environ.get("P4EDITOR")
         else:
-            editor = read_pipe("git var GIT_EDITOR").strip()
+            editor = git_read_pipe(["var", "GIT_EDITOR"])
         system(["sh", "-c", ('%s "$@"' % editor), editor, template_file])
 
         # If the file was not saved, prompt to see if this patch should
@@ -1932,8 +1942,7 @@ class P4Submit(Command, P4UserMap):
             del(os.environ["P4DIFF"])
         diff = ""
         for editedFile in editedFiles:
-            diff += p4_read_pipe(['diff', '-du',
-                                  wildcard_encode(editedFile)])
+            diff += p4_read_pipe(['diff', '-du', wildcard_encode(editedFile)])
 
         # new file diff
         newdiff = ""
@@ -1958,12 +1967,16 @@ class P4Submit(Command, P4UserMap):
     def applyCommit(self, id):
         """Apply one commit, return True if it succeeded."""
 
-        print("Applying", read_pipe(["git", "show", "-s",
-                                     "--format=format:%h %s", id]))
+        print("Applying", git_read_pipe(["show", "-s", "--format=format:%h %s", id]))
 
         (p4User, gitEmail) = self.p4UserForCommit(id)
 
-        diff = read_pipe_lines("git diff-tree -r %s \"%s^\" \"%s\"" % (self.diffOpts, id, id))
+        diff_cmd = ["diff-tree", "-r"]
+        diff_cmd += self.diffOpts.split()
+        diff_cmd += ["{0}^".format(id), id]
+
+        diff = git_read_pipe_lines(diff_cmd)
+
         filesToAdd = set()
         filesToChangeType = set()
         filesToDelete = set()
@@ -2064,7 +2077,7 @@ class P4Submit(Command, P4UserMap):
                     if pattern:
                         # this file is a possibility...look for RCS keywords.
                         regexp = re.compile(pattern, re.VERBOSE)
-                        for line in read_pipe_lines(["git", "diff", "%s^..%s" % (id, id), file]):
+                        for line in git_read_pipe_lines(["diff", "%s^..%s" % (id, id), file]):
                             if regexp.search(line):
                                 if verbose:
                                     print("got keyword match on %s in %s in %s" % (pattern, line, file))
@@ -2142,7 +2155,7 @@ class P4Submit(Command, P4UserMap):
         tmpFile = os.fdopen(handle, "w+b")
         if self.isWindows:
             submitTemplate = submitTemplate.replace("\n", "\r\n")
-        tmpFile.write(submitTemplate)
+        tmpFile.write(to_p4_string(submitTemplate))
         tmpFile.close()
 
         if self.prepare_p4_only:
@@ -2193,7 +2206,7 @@ class P4Submit(Command, P4UserMap):
                 tmpFile.close()
                 if self.isWindows:
                     message = message.replace("\r\n", "\n")
-                submitTemplate = message[:message.index(separatorLine)]
+                submitTemplate = message[:message.index(to_p4_string(separatorLine))]
 
                 if update_shelve:
                     p4_write_pipe(['shelve', '-r', '-i'], submitTemplate)
@@ -2263,7 +2276,7 @@ class P4Submit(Command, P4UserMap):
             inHeader = True
             isAnnotated = False
             body = []
-            for l in read_pipe_lines(["git", "cat-file", "-p", name]):
+            for l in git_read_pipe_lines(["cat-file", "-p", name]):
                 l = l.strip()
                 if inHeader:
                     if re.match(r'tag\s+', l):
@@ -2399,13 +2412,13 @@ class P4Submit(Command, P4UserMap):
         if self.commit != "":
             if self.commit.find("..") != -1:
                 limits_ish = self.commit.split("..")
-                for line in read_pipe_lines(["git", "rev-list", "--no-merges", "%s..%s" % (limits_ish[0], limits_ish[1])]):
+                for line in git_read_pipe_lines(["rev-list", "--no-merges", "%s..%s" % (limits_ish[0], limits_ish[1])]):
                     commits.append(line.strip())
                 commits.reverse()
             else:
                 commits.append(self.commit)
         else:
-            for line in read_pipe_lines(["git", "rev-list", "--no-merges", "%s..%s" % (self.origin, committish)]):
+            for line in git_read_pipe_lines(["rev-list", "--no-merges", "%s..%s" % (self.origin, committish)]):
                 commits.append(line.strip())
             commits.reverse()
 
@@ -2463,8 +2476,7 @@ class P4Submit(Command, P4UserMap):
         last = len(commits) - 1
         for i, commit in enumerate(commits):
             if self.dry_run:
-                print(" ", read_pipe(["git", "show", "-s",
-                                      "--format=format:%h %s", commit]))
+                print(" ", git_read_pipe(["show", "-s", "--format=format:%h %s", commit]))
                 ok = True
             else:
                 ok = self.applyCommit(commit)
@@ -2534,8 +2546,7 @@ class P4Submit(Command, P4UserMap):
                         star = "*"
                     else:
                         star = " "
-                    print(star, read_pipe(["git", "show", "-s",
-                                           "--format=format:%h %s",  c]))
+                    print(star, git_read_pipe(["show", "-s", "--format=format:%h %s",  c]))
                 print("You will have to do 'git p4 sync' and rebase.")
 
         if gitConfigBool("git-p4.exportLabels"):
@@ -2911,7 +2922,7 @@ class P4Sync(Command, P4UserMap):
             git_mode = "120000"
             # p4 print on a symlink sometimes contains "target\n";
             # if it does, remove the newline
-            data = ''.join(contents)
+            data = b''.join(contents)
             if not data:
                 # Some version of p4 allowed creating a symlink that pointed
                 # to nothing.  This causes p4 errors when checking out such
@@ -2919,7 +2930,7 @@ class P4Sync(Command, P4UserMap):
                 # the bad symlink; hopefully a future change fixes it.
                 print("\nIgnoring empty symlink in %s" % file['depotFile'])
                 return
-            elif data[-1] == '\n':
+            elif data[-1] == b'\n':
                 contents = [data[:-1]]
             else:
                 contents = [data]
@@ -2944,7 +2955,7 @@ class P4Sync(Command, P4UserMap):
                     raise e
             else:
                 if p4_version_string().find('/NT') >= 0:
-                    text = text.replace('\r\n', '\n')
+                    text = text.replace(b'\r\n', b'\n')
                 contents = [ text ]
 
         if type_base == "apple":
@@ -2965,7 +2976,7 @@ class P4Sync(Command, P4UserMap):
         pattern = p4_keywords_regexp_for_type(type_base, type_mods)
         if pattern:
             regexp = re.compile(pattern, re.VERBOSE)
-            text = ''.join(contents)
+            text = b''.join(contents)
             text = regexp.sub(r'$\1$', text)
             contents = [ text ]
 
@@ -3029,11 +3040,14 @@ class P4Sync(Command, P4UserMap):
         # pick up the new file information... for the
         # 'data' field we need to append to our array
         for k in marshalled.keys():
+            assert isinstance(marshalled, PolyStringDict)
+            assert isinstance(k, str), "{0}: key should be string, not bytes here".format(marshalled)
             if k == 'data':
                 if 'streamContentSize' not in self.stream_file:
                     self.stream_file['streamContentSize'] = 0
-                self.stream_file['streamContentSize'] += len(marshalled['data'])
-                self.stream_contents.append(marshalled['data'])
+                raw_data = marshalled.get_raw('data')
+                self.stream_file['streamContentSize'] += len(raw_data)
+                self.stream_contents.append(raw_data)
             else:
                 self.stream_file[k] = marshalled[k]
 
@@ -3153,7 +3167,7 @@ class P4Sync(Command, P4UserMap):
         return hasPrefix
 
     def writeGitStream(self, s):
-        return self.gitStream.write(s.encode())
+        return self.gitStream.write(s.encode(git_encoding))
 
     def commit(self, details, files, branch, parent = ""):
         epoch = details["time"]
@@ -3304,7 +3318,7 @@ class P4Sync(Command, P4UserMap):
                     gitCommit = ":%d" % changelist       # use a fast-import mark
                     commitFound = True
                 else:
-                    gitCommit = read_pipe(["git", "rev-list", "--max-count=1",
+                    gitCommit = git_read_pipe(["rev-list", "--max-count=1",
                         "--reverse", ":/\[git-p4:.*change = %d\]" % changelist], ignore_error=True)
                     if len(gitCommit) == 0:
                         print("importing label %s: could not find git commit for changelist %d" % (name, changelist))
@@ -3444,7 +3458,7 @@ class P4Sync(Command, P4UserMap):
         while True:
             if self.verbose:
                 print("trying: earliest %s latest %s" % (earliestCommit, latestCommit))
-            next = read_pipe("git rev-list --bisect %s %s" % (latestCommit, earliestCommit)).strip()
+            next = git_read_pipe(["rev-list", "--bisect", latestCommit, earliestCommit])
             if len(next) == 0:
                 if self.verbose:
                     print("argh")
@@ -3497,10 +3511,10 @@ class P4Sync(Command, P4UserMap):
 
     def searchParent(self, parent, branch, target):
         parentFound = False
-        for blob in read_pipe_lines(["git", "rev-list", "--reverse",
+        for blob in git_read_pipe_lines(["rev-list", "--reverse",
                                      "--no-merges", parent]):
             blob = blob.strip()
-            if len(read_pipe(["git", "diff-tree", blob, target])) == 0:
+            if len(git_read_pipe(["diff-tree", blob, target])) == 0:
                 parentFound = True
                 if self.verbose:
                     print("Found parent of %s in commit %s" % (branch, blob))
@@ -3939,7 +3953,7 @@ class P4Sync(Command, P4UserMap):
         # Cleanup temporary branches created during import
         if self.tempBranches != []:
             for branch in self.tempBranches:
-                read_pipe("git update-ref -d %s" % branch)
+                git_read_pipe(["update-ref", "-d", branch])
             os.rmdir(os.path.join(os.environ.get("GIT_DIR", ".git"), self.tempBranchLocation))
 
         # Create a symbolic ref p4/HEAD pointing to p4/<branch> to allow
@@ -3971,7 +3985,7 @@ class P4Rebase(Command):
     def rebase(self):
         if os.system("git update-index --refresh") != 0:
             die("Some files in your working directory are modified and different than what is in your index. You can use git update-index <filename> to bring the index up to date or stash away all your changes with git stash.");
-        if len(read_pipe("git diff-index HEAD --")) > 0:
+        if len(git_read_pipe(["diff-index", "HEAD", "--"])) > 0:
             die("You have uncommitted changes. Please commit them before rebasing or stash them away with git stash.");
 
         [upstream, settings] = findUpstreamBranchPoint()
@@ -3982,7 +3996,8 @@ class P4Rebase(Command):
         upstream = re.sub("~[0-9]+$", "", upstream)
 
         print("Rebasing the current branch onto %s" % upstream)
-        oldHead = read_pipe("git rev-parse HEAD").strip()
+        oldHead = git_read_pipe(["rev-parse", "HEAD"])
+        assert oldHead != None, "cannot get HEAD revision"
         system("git rebase %s" % upstream)
         system("git diff-tree --stat --summary -M %s HEAD --" % oldHead)
         return True
@@ -4161,10 +4176,9 @@ class P4Branches(Command):
         if originP4BranchesExist():
             createOrUpdateBranchesFromOrigin()
 
-        cmdline = "git rev-parse --symbolic "
-        cmdline += " --remotes"
+        cmdline = ["rev-parse", "--symbolic", "--remotes"]
 
-        for line in read_pipe_lines(cmdline):
+        for line in git_read_pipe_lines(cmdline):
             line = line.strip()
 
             if not line.startswith('p4/') or line == "p4/HEAD":
@@ -4245,9 +4259,9 @@ def main():
             cmd.gitdir = os.path.abspath(".git")
             if not isValidGitDir(cmd.gitdir):
                 # "rev-parse --git-dir" without arguments will try $PWD/.git
-                cmd.gitdir = read_pipe("git rev-parse --git-dir").strip()
+                cmd.gitdir = git_read_pipe(["rev-parse", "--git-dir"])
                 if os.path.exists(cmd.gitdir):
-                    cdup = read_pipe("git rev-parse --show-cdup").strip()
+                    cdup = git_read_pipe(["rev-parse", "--show-cdup"])
                     if len(cdup) > 0:
                         chdir(cdup);
 
